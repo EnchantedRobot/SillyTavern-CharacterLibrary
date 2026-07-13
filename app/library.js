@@ -22348,7 +22348,7 @@ function extractMediaUrls(text) {
     }
     
     // Match raw URLs for media files
-    const urlPattern = /(https?:\/\/[^\s<>"{}|\\^`\[\]]+\.(?:png|jpg|jpeg|gif|webp|svg|mp4|webm|mov|mp3|wav|ogg|m4a))/gi;
+    const urlPattern = /(https?:\/\/[^\s<>"{}|\\^`\[\]]+\.(?:png|jpg|jpeg|gif|webp|svg|mp4|webm|mov|mp3|wav|ogg|m4a)(?:\/[^\s<>"'{}|\\^`\[\]]+)?)/gi;
     while ((match = urlPattern.exec(text)) !== null) {
         urls.push(match[1]);
     }

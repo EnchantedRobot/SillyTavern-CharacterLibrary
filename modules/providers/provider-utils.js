@@ -253,6 +253,55 @@ export async function fetchWithProxy(url, opts = {}) {
     return r;
 }
 
+/**
+ * Rewrite a remote http(s) URL so the browser loads it through SillyTavern's
+ * CORS proxy. The request then egresses from the ST *server* and obeys
+ * `requestProxy` in config.yaml (e.g. a VPN), instead of riding the browser's
+ * own IP. Relative, same-origin, data:, blob: and already-proxied URLs are
+ * returned unchanged.
+ *
+ * Use this for <img> thumbnails / avatars that would otherwise be fetched
+ * directly from a provider CDN by the browser (which `/proxy/` cannot
+ * intercept once the URL is assigned to an element's `src`).
+ *
+ * @param {string} url
+ * @returns {string}
+ */
+export function proxify(url) {
+    if (!url || typeof url !== 'string') return url;
+    if (!/^https?:\/\//i.test(url)) return url;            // relative / data: / blob:
+    if (url.startsWith(`${location.origin}/`)) return url; // already same-origin
+    if (url.startsWith('/proxy/')) return url;             // already proxied
+    return `/proxy/${encodeURIComponent(url)}`;
+}
+
+/**
+ * Proxy-FIRST fetch: route through ST's CORS proxy so the request egresses
+ * from the server (obeying `requestProxy` / a VPN), falling back to a direct
+ * browser fetch only if the proxy itself is unreachable or disabled. This is
+ * the inverse of {@link fetchWithProxy} (which tries direct first) and mirrors
+ * the mega.js download patch — use it for browse/search GETs that should not
+ * leak the browser's real IP to a provider API.
+ *
+ * @param {string} url
+ * @param {RequestInit} [opts]
+ * @returns {Promise<Response>}
+ */
+export async function proxyFetch(url, opts = {}) {
+    try {
+        const r = await fetch(`/proxy/${encodeURIComponent(url)}`, opts);
+        // A disabled CORS proxy answers 404 with this marker — fall back to direct.
+        if (r.status === 404) {
+            const t = await r.clone().text().catch(() => '');
+            if (t.includes('CORS proxy is disabled')) return fetch(url, opts);
+        }
+        return r;
+    } catch (err) {
+        if (err.name === 'AbortError' || err.name === 'TimeoutError') throw err;
+        return fetch(url, opts);
+    }
+}
+
 // ========================================
 // BROWSE ERROR BANNER
 // ========================================

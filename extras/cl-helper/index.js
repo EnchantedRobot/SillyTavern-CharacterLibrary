@@ -123,6 +123,39 @@ async function peekImageDimensions(filePath) {
     }
 }
 
+// The bundled jimp PNG decoder (jsquash/squoosh wasm) throws `unwrap_throw` on
+// PNGs whose ancillary text chunks exceed ~1MB. Character cards embed their JSON
+// (plus any base64 media / large lorebook) in tEXt 'chara'/'ccv3' chunks, which
+// routinely blow past that limit and make thumbnail decode fail. Text chunks never
+// affect pixels, so drop them before handing the buffer to jimp. Returns the input
+// unchanged for non-PNG data or a PNG with no text chunks.
+function stripPngTextChunks(buf) {
+    const SIG = [137, 80, 78, 71, 13, 10, 26, 10];
+    if (buf.length < 8) return buf;
+    for (let i = 0; i < 8; i++) if (buf[i] !== SIG[i]) return buf; // not a PNG
+    const out = [buf.subarray(0, 8)];
+    let pos = 8;
+    let stripped = false;
+    while (pos + 8 <= buf.length) {
+        const len = buf.readUInt32BE(pos);
+        const type = buf.toString('latin1', pos + 4, pos + 8);
+        const end = pos + 12 + len;
+        if (end > buf.length) return buf; // truncated/corrupt: leave it to jimp
+        if (type === 'tEXt' || type === 'iTXt' || type === 'zTXt') stripped = true;
+        else out.push(buf.subarray(pos, end));
+        if (type === 'IEND') break;
+        pos = end;
+    }
+    return stripped ? Buffer.concat(out) : buf;
+}
+
+// Read an image file for thumbnailing, stripping oversized PNG text chunks that
+// would otherwise crash jimp's wasm decoder (see stripPngTextChunks).
+async function readImageForThumb(path) {
+    const buf = await readFile(path);
+    return _Jimp.read(stripPngTextChunks(buf));
+}
+
 let _Jimp = null;
 let _imagesDir = null;
 let _charactersDir = null;
@@ -305,7 +338,7 @@ function registerThumbnailRoutes(router) {
 
         try {
             const buffer = await withThumbSlot(async () => {
-                const image = await _Jimp.read(originalPath);
+                const image = await readImageForThumb(originalPath);
                 image.cover({ w: size, h: size });
                 return image.getBuffer('image/jpeg', { quality: THUMB_QUALITY, jpegColorSpace: 'ycbcr' });
             });
@@ -409,7 +442,7 @@ function registerThumbnailRoutes(router) {
 
         try {
             const buffer = await withThumbSlot(async () => {
-                const image = await _Jimp.read(originalPath);
+                const image = await readImageForThumb(originalPath);
                 // Match .char-card aspect (2:3) so browser object-fit: cover is a no-op and doesnt double-crop.
                 image.cover({ w: size, h: Math.round(size * 1.5) });
                 return image.getBuffer('image/jpeg', { quality: THUMB_QUALITY, jpegColorSpace: 'ycbcr' });
@@ -539,7 +572,7 @@ async function runAvatarPopulateJob(size, files, charactersDir, avatarThumbDir) 
                 if (needs) {
                     try {
                         const buffer = await withThumbSlot(async () => {
-                            const image = await _Jimp.read(originalPath);
+                            const image = await readImageForThumb(originalPath);
                             image.cover({ w: size, h: Math.round(size * 1.5) });
                             return image.getBuffer('image/jpeg', { quality: THUMB_QUALITY, jpegColorSpace: 'ycbcr' });
                         });
