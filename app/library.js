@@ -21931,9 +21931,6 @@ if (helpModal) {
 // Media Localization Feature
 // ==============================================
 
-const FAST_SKIP_MIN_SIZE = 1024;
-const FAST_SKIP_MIN_NAME_LENGTH = 4;
-
 // Duplicated in index.js (extractSanitizedUrlNameForChat). keep in sync
 const CDN_VARIANT_NAMES = new Set(['public', 'original', 'raw', 'full', 'thumbnail', 'thumb',
     'medium', 'small', 'large', 'xl', 'default', 'image', 'photo', 'download', 'view',
@@ -21967,51 +21964,14 @@ function extractSanitizedUrlName(url) {
     }
 }
 
+// Index build lives in modules/media-dedup.js (fork-local). Without it we return
+// an empty index, which just means every file falls through to the hash path.
 async function getExistingFileIndex(folderName) {
-    const index = new Map();
-    try {
-        const response = await apiRequest(ENDPOINTS.IMAGES_LIST, 'POST', { folder: folderName, type: 7 });
-        if (!response.ok) return index;
-        const files = await response.json();
-        if (!files || files.length === 0) return index;
-
-        const safeFolderName = sanitizeFolderName(folderName);
-        for (const file of files) {
-            const fileName = (typeof file === 'string') ? file : file.name;
-            if (!fileName) continue;
-            if (!fileName.match(/\.(png|jpg|jpeg|webp|gif|bmp|mp3|wav|ogg|m4a|mp4|webm)$/i)) continue;
-
-            const localPath = `/user/images/${encodeURIComponent(safeFolderName)}/${encodeURIComponent(fileName)}`;
-            const nameNoExt = fileName.includes('.') ? fileName.substring(0, fileName.lastIndexOf('.')) : fileName;
-
-            const embeddedMatch = nameNoExt.match(/^(?:localized_media|lorebook_media)_\d+_(.+)$/);
-            if (embeddedMatch) {
-                index.set(embeddedMatch[1].toLowerCase(), { fileName, localPath });
-                continue;
-            }
-
-            const galleryMatch = nameNoExt.match(/^[a-z]+gallery_[a-f0-9]+_(.+)$/);
-            if (galleryMatch) {
-                index.set(galleryMatch[1].toLowerCase(), { fileName, localPath });
-                continue;
-            }
-        }
-        return index;
-    } catch (error) {
-        console.error('[Localize] Error building file index:', error);
-        return index;
+    if (!window.MediaDedup) {
+        console.warn('[Localize] MediaDedup module unavailable; name-based skip disabled');
+        return new Map();
     }
-}
-
-async function validateFileByHead(localPath) {
-    try {
-        const resp = await fetch(localPath, { method: 'HEAD' });
-        if (!resp.ok) return false;
-        const contentLength = parseInt(resp.headers.get('Content-Length') || '0', 10);
-        return contentLength >= FAST_SKIP_MIN_SIZE;
-    } catch {
-        return false;
-    }
+    return window.MediaDedup.buildFileIndex(folderName);
 }
 
 /**
@@ -22022,6 +21982,9 @@ async function validateFileByHead(localPath) {
 async function buildDedupState(folderName) {
     const useFastSkip = getSetting('fastFilenameSkip') || false;
     const validateHeaders = useFastSkip && (getSetting('fastSkipValidateHeaders') || false);
+
+    // Needed by every phase's pre-download dead-URL check.
+    await window.MediaDedup?.loadLedger();
 
     let fileNameIndex = null;
     let hashMap = null;
@@ -22053,7 +22016,7 @@ async function buildDedupState(folderName) {
  * @returns {Promise<{success: number, skipped: number, errors: number, renamed: number}>}
  */
 async function downloadEmbeddedMediaForCharacter(folderName, mediaUrls, options = {}) {
-    const { onProgress, onLog, onLogUpdate, shouldAbort, abortSignal, prefix = 'localized_media', dedupState: externalDedup, downloadFnMap } = options;
+    const { onProgress, onLog, onLogUpdate, shouldAbort, abortSignal, prefix = 'localized_media', dedupState: externalDedup, downloadFnMap, nameHints } = options;
     
     let successCount = 0;
     let errorCount = 0;
@@ -22068,6 +22031,7 @@ async function downloadEmbeddedMediaForCharacter(folderName, mediaUrls, options 
     const dedup = externalDedup || await buildDedupState(folderName);
     const { useFastSkip, validateHeaders, ensureHashMap } = dedup;
     let { fileNameIndex } = dedup;
+    const MD = window.MediaDedup;
     
     let startIndex = Date.now(); // Use timestamp as start index for unique filenames
     let filenameSkippedCount = 0;
@@ -22081,45 +22045,42 @@ async function downloadEmbeddedMediaForCharacter(folderName, mediaUrls, options 
         const url = mediaUrls[i];
         const fileIndex = startIndex + i;
         
+        // Extractors resolve a real filename; it beats guessing from the URL,
+        // which is worthless for synthetic ones like mega://folder/handle.
+        const nameHint = nameHints?.get(url) || '';
+        // '' means "no usable hint" — saveMediaFromMemory keeps its URL-derived name
+        const saveName = MD?.saveNameFor(url, nameHint) || '';
+
         // Truncate URL for display
         const displayUrl = url.length > 60 ? url.substring(0, 60) + '...' : url;
         const logEntry = onLog ? onLog(`Checking ${displayUrl}`, 'pending') : null;
         
-        // Fast filename skip — check before downloading
-        if (useFastSkip && fileNameIndex) {
-            const sanitizedName = extractSanitizedUrlName(url);
-            if (sanitizedName.length >= FAST_SKIP_MIN_NAME_LENGTH) {
-                const match = fileNameIndex.get(sanitizedName.toLowerCase());
-                if (match) {
-                    // If fixFilenames is on and the matched file has the wrong prefix, skip the fast path
-                    // so it falls through to hash-check where reclassification happens.
-                    // But never bypass for a higher-priority prefix (e.g. localized_media > extgallery).
-                    const fixFilenames = getSetting('fixFilenames') !== false;
-                    const hasCorrectPrefix = match.fileName.startsWith(prefix + '_');
-                    const PREFIX_PRIORITY_FS = { 'localized_media': 4, 'lorebook_media': 3, 'extgallery': 2 };
-                    const matchPriority = Object.entries(PREFIX_PRIORITY_FS).find(([p]) => match.fileName.startsWith(p + '_'))?.[1] || 0;
-                    const currentPriority = PREFIX_PRIORITY_FS[prefix] || 0;
-                    const wouldDowngrade = matchPriority >= currentPriority;
-                    if (fixFilenames && !hasCorrectPrefix && !wouldDowngrade) {
-                        debugLog(`[EmbeddedMedia] Fast skip bypassed (wrong prefix): ${match.fileName} needs ${prefix}_*`);
-                    } else {
-                        let valid = true;
-                        if (validateHeaders) {
-                            valid = await validateFileByHead(match.localPath);
-                            if (!valid) {
-                                debugLog(`[EmbeddedMedia] Fast skip rejected (HEAD validation): ${match.fileName}`);
-                            }
-                        }
-                        if (valid) {
-                            skippedCount++;
-                            filenameSkippedCount++;
-                            if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Skipped (filename match): ${match.fileName}`, 'success');
-                            if (onProgress) onProgress(i + 1, mediaUrls.length);
-                            continue;
-                        }
-                    }
-                }
+        // Name match against what's already on disk — before any bytes move.
+        // Runs ahead of the dead check so a file we already hold logs as a
+        // filename match even if its source has since gone away.
+        if (useFastSkip && fileNameIndex && MD) {
+            const match = await MD.findExistingFile({ url, filename: nameHint }, {
+                index: fileNameIndex,
+                prefix,
+                validateHeaders,
+                fixFilenames: getSetting('fixFilenames') !== false,
+            });
+            if (match) {
+                skippedCount++;
+                filenameSkippedCount++;
+                if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Skipped (filename match): ${match.fileName}`, 'success');
+                if (onProgress) onProgress(i + 1, mediaUrls.length);
+                continue;
             }
+        }
+
+        // Known-dead URL — never spend a request on it again. Counted as skipped,
+        // not failed: there is nothing to retry and nothing the user can fix.
+        if (MD?.isDead(url)) {
+            skippedCount++;
+            if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Unreachable, skipping: ${displayUrl} (${MD.deadReason(url)})`, 'info');
+            if (onProgress) onProgress(i + 1, mediaUrls.length);
+            continue;
         }
         
         // Download to memory first to check hash (with 30s timeout)
@@ -22139,12 +22100,21 @@ async function downloadEmbeddedMediaForCharacter(folderName, mediaUrls, options 
         }
         
         if (!downloadResult.success) {
-            errorCount++;
-            if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Failed: ${displayUrl} - ${downloadResult.error}`, 'error');
+            // A 404 is not a retryable error: bank it so this character can
+            // still reach "complete" instead of failing forever.
+            const failure = MD?.recordFailure(url, MD.classifyFailure(downloadResult));
+            if (failure?.dead) {
+                skippedCount++;
+                if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Unreachable, giving up: ${displayUrl} - ${downloadResult.error}`, 'info');
+            } else {
+                errorCount++;
+                if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Failed: ${displayUrl} - ${downloadResult.error}`, 'error');
+            }
             downloadResult = null;
             if (onProgress) onProgress(i + 1, mediaUrls.length);
             continue;
         }
+        MD?.recordSuccess(url);
         
         // Calculate hash of downloaded content
         const hashMap = await ensureHashMap();
@@ -22195,7 +22165,7 @@ async function downloadEmbeddedMediaForCharacter(folderName, mediaUrls, options 
             const needsRename = hasWrongExtension || (isProviderGalleryFile && currentPriority > 1) || (!isAlreadyLocalized && !isProviderGalleryFile) || (fixFilenames && !hasCorrectPrefix && !wouldDowngrade);
             
             if (needsRename) {
-                const renameResult = await renameToLocalizedFormat(existingFile, url, folderName, fileIndex, downloadResult, prefix);
+                const renameResult = await renameToLocalizedFormat(existingFile, url, folderName, fileIndex, downloadResult, prefix, saveName);
                 downloadResult = null;
                 if (renameResult.success) {
                     renamedCount++;
@@ -22212,9 +22182,9 @@ async function downloadEmbeddedMediaForCharacter(folderName, mediaUrls, options 
                 const existingSanitized = isAlreadyLocalized
                     ? existingFile.fileName.match(/^(?:localized_media|lorebook_media)_\d+_(.+)\.[^.]+$/)
                     : null;
-                const currentSanitized = existingSanitized ? extractSanitizedUrlName(url) : null;
+                const currentSanitized = existingSanitized ? (saveName || extractSanitizedUrlName(url)) : null;
                 if (existingSanitized && currentSanitized && existingSanitized[1] !== currentSanitized) {
-                    const aliasResult = await saveMediaFromMemory({ arrayBuffer: downloadResult.arrayBuffer, contentType: downloadResult.contentType }, url, folderName, fileIndex, prefix);
+                    const aliasResult = await saveMediaFromMemory({ arrayBuffer: downloadResult.arrayBuffer, contentType: downloadResult.contentType }, url, folderName, fileIndex, prefix, saveName);
                     downloadResult = null;
                     if (aliasResult.success) {
                         successCount++;
@@ -22237,7 +22207,7 @@ async function downloadEmbeddedMediaForCharacter(folderName, mediaUrls, options 
         
         // Not a duplicate, save the file
         if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Saving ${displayUrl}...`, 'pending');
-        const result = await saveMediaFromMemory(downloadResult, url, folderName, fileIndex, prefix);
+        const result = await saveMediaFromMemory(downloadResult, url, folderName, fileIndex, prefix, saveName);
         downloadResult = null; // Release after save
         
         if (result.success) {
@@ -22245,10 +22215,7 @@ async function downloadEmbeddedMediaForCharacter(folderName, mediaUrls, options 
             // Add to hash map to avoid downloading same file twice in this session
             hashMap.set(contentHash, { fileName: result.filename, localPath: result.localPath });
             // Update filename index for cross-phase fast-skip
-            if (fileNameIndex) {
-                const savedSanitized = extractSanitizedUrlName(url);
-                if (savedSanitized) fileNameIndex.set(savedSanitized.toLowerCase(), { fileName: result.filename, localPath: result.localPath });
-            }
+            if (fileNameIndex) MD?.noteSavedFile(fileNameIndex, { url, filename: nameHint }, result);
             if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Saved: ${result.filename}`, 'success');
         } else {
             errorCount++;
@@ -22273,12 +22240,13 @@ async function downloadEmbeddedMediaForCharacter(folderName, mediaUrls, options 
  * @param {number} index - File index for naming
  * @param {Object} downloadResult - Result from downloadMediaToMemory
  * @param {string} [prefix='localized_media'] - Filename prefix
+ * @param {string} [nameHint] - Preferred base name (extractor-supplied filename)
  */
-async function renameToLocalizedFormat(existingFile, originalUrl, folderName, index, downloadResult, prefix = 'localized_media') {
+async function renameToLocalizedFormat(existingFile, originalUrl, folderName, index, downloadResult, prefix = 'localized_media', nameHint = '') {
     try {
         // Save with new name using saveMediaFromMemory which determines correct extension
         // from the detected content type (via magic bytes), not the old filename
-        const saveResult = await saveMediaFromMemory(downloadResult, originalUrl, folderName, index, prefix);
+        const saveResult = await saveMediaFromMemory(downloadResult, originalUrl, folderName, index, prefix, nameHint);
         
         if (!saveResult.success) {
             return { success: false, error: saveResult.error };
@@ -22933,8 +22901,9 @@ async function downloadMediaToMemory(url, timeoutMs = 30000, abortSignal = null)
  * @param {string} folderName - Gallery folder name (use getGalleryFolderName() for unique folders)
  * @param {number} index - File index for naming
  * @param {string} [prefix='localized_media'] - Filename prefix
+ * @param {string} [nameHint] - Preferred base name (extractor-supplied filename)
  */
-async function saveMediaFromMemory(downloadResult, url, folderName, index, prefix = 'localized_media') {
+async function saveMediaFromMemory(downloadResult, url, folderName, index, prefix = 'localized_media', nameHint = '') {
     try {
         const { arrayBuffer, contentType } = downloadResult;
         
@@ -22989,8 +22958,9 @@ async function saveMediaFromMemory(downloadResult, url, folderName, index, prefi
             }
         }
         
-        // Extract sanitized filename from URL (handles CDN variant segments)
-        const sanitizedName = extractSanitizedUrlName(url) || 'media';
+        // Prefer an extractor-supplied name; otherwise derive from the URL
+        // (which handles CDN variant segments).
+        const sanitizedName = nameHint || extractSanitizedUrlName(url) || 'media';
         
         // Generate local filename
         const filenameBase = `${prefix}_${index}_${sanitizedName}`;
@@ -23064,12 +23034,14 @@ async function downloadExternalGalleryForCharacter(character, folderName, option
     const { onLog, onLogUpdate, onProgress, shouldAbort, abortSignal, dedupState, galleryPageUrls: overrideUrls } = options;
 
     const result = { success: 0, skipped: 0, errors: 0, aborted: false };
+    const MD = window.MediaDedup;
 
     const galleryUrls = overrideUrls || (typeof window.findCharacterGalleryUrls === 'function'
         ? window.findCharacterGalleryUrls(character)
         : []);
     if (galleryUrls.length === 0) return result;
 
+    await MD?.loadLedger();
     let allImages = [];
 
     for (let i = 0; i < galleryUrls.length; i++) {
@@ -23080,6 +23052,15 @@ async function downloadExternalGalleryForCharacter(character, folderName, option
 
         const gUrl = galleryUrls[i];
         const displayUrl = gUrl.length > 60 ? gUrl.substring(0, 60) + '...' : gUrl;
+
+        // A deleted MEGA folder is the usual way a character gets pinned in a
+        // permanent retry loop — the page itself is ledgered, not just its files.
+        if (MD?.isDead(gUrl)) {
+            result.skipped++;
+            if (onLog) onLog(`Unreachable gallery, skipping: ${displayUrl} (${MD.deadReason(gUrl)})`, 'info');
+            continue;
+        }
+
         const logEntry = onLog ? onLog(`Extracting: ${displayUrl}`, 'pending') : null;
 
         try {
@@ -23090,10 +23071,17 @@ async function downloadExternalGalleryForCharacter(character, folderName, option
                 return result;
             }
             if (extracted.error) {
-                if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Failed to extract: ${displayUrl} (${extracted.error})`, 'error');
-                result.errors++;
+                const failure = MD?.recordFailure(gUrl, MD.classifyExtractionFailure(extracted.error));
+                if (failure?.dead) {
+                    result.skipped++;
+                    if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Unreachable gallery, giving up: ${displayUrl} (${extracted.error})`, 'info');
+                } else {
+                    result.errors++;
+                    if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Failed to extract: ${displayUrl} (${extracted.error})`, 'error');
+                }
                 continue;
             }
+            MD?.recordSuccess(gUrl);
             if (extracted.images.length > 0) {
                 if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Found ${extracted.images.length} image(s) from ${displayUrl}`, 'success');
                 allImages.push(...extracted.images);
@@ -23111,8 +23099,12 @@ async function downloadExternalGalleryForCharacter(character, folderName, option
 
     const imageUrls = allImages.map(img => img.url);
     const downloadFnMap = new Map();
+    const nameHints = new Map();
     for (const img of allImages) {
         if (typeof img.downloadFn === 'function') downloadFnMap.set(img.url, img.downloadFn);
+        // The real filename is the only usable dedup key for extractors whose
+        // URLs are synthetic (MEGA) or all-identical (Drive's /uc?id=...).
+        if (img.filename) nameHints.set(img.url, img.filename);
     }
 
     const downloadResult = await downloadEmbeddedMediaForCharacter(folderName, imageUrls, {
@@ -23123,7 +23115,8 @@ async function downloadExternalGalleryForCharacter(character, folderName, option
         shouldAbort,
         abortSignal,
         dedupState,
-        downloadFnMap
+        downloadFnMap,
+        nameHints
     });
 
     result.success += downloadResult.success;
@@ -23326,6 +23319,9 @@ async function downloadCharacterMedia(character, folderName, options = {}) {
 
     if (isAborted()) result.aborted = true;
     const finalResult = sumTotals(result);
+
+    // Persist anything the ledger learned this run
+    await window.MediaDedup?.flushLedger();
 
     // Pre-warm thumbnails for any newly saved images
     if (finalResult.totals.success > 0) {

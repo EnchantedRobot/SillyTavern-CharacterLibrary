@@ -1,6 +1,7 @@
 // Provider Interface - contract for external character sources
 
-import { saveGalleryImage, resolveGalleryMediaName } from './provider-utils.js';
+import { saveGalleryImage } from './provider-utils.js';
+import MediaDedup from '../media-dedup.js';
 
 /**
  * @typedef {Object} ProviderLinkInfo
@@ -595,6 +596,9 @@ export class ProviderBase {
             await ensureHashMap();
         }
 
+        // buildDedupState normally does this; the inline fallback above doesn't.
+        await MediaDedup.loadLedger();
+
         for (let i = 0; i < galleryImages.length; i++) {
             if ((shouldAbort?.()) || abortSignal?.aborted) {
                 return { success: successCount, skipped: skippedCount, errors: errorCount, filenameSkipped: filenameSkippedCount, aborted: true };
@@ -604,39 +608,48 @@ export class ProviderBase {
             const displayUrl = image.url.length > 60 ? image.url.substring(0, 60) + '...' : image.url;
             const imgLog = onLog?.(`Checking ${displayUrl}`, 'pending') ?? null;
 
+            // Name match runs ahead of the dead check so a file we already hold
+            // logs as a filename match even if its source has since gone away.
             if (useFastSkip && fileNameIndex) {
-                const sanitizedName = resolveGalleryMediaName(image, api);
-                if (sanitizedName.length >= 4) {
-                    const match = fileNameIndex.get(sanitizedName.toLowerCase());
-                    if (match) {
-                        let valid = true;
-                        if (validateHeaders) {
-                            try {
-                                const resp = await fetch(match.localPath, { method: 'HEAD' });
-                                const size = parseInt(resp.headers.get('Content-Length') || '0', 10);
-                                valid = resp.ok && size >= 1024;
-                            } catch { valid = false; }
-                            if (!valid) api.debugLog?.('[Gallery] Fast skip rejected (HEAD validation):', match.fileName);
-                        }
-                        if (valid) {
-                            skippedCount++;
-                            filenameSkippedCount++;
-                            if (onLogUpdate && imgLog) onLogUpdate(imgLog, `Skipped (filename match): ${match.fileName}`, 'success');
-                            onProgress?.(i + 1, galleryImages.length);
-                            continue;
-                        }
-                    }
+                // fixFilenames stays off here: this loop has no rename path, so a
+                // mis-prefixed match has nothing better to fall through to.
+                const match = await MediaDedup.findExistingFile(
+                    { url: image.url, filename: image.name },
+                    { index: fileNameIndex, validateHeaders }
+                );
+                if (match) {
+                    skippedCount++;
+                    filenameSkippedCount++;
+                    if (onLogUpdate && imgLog) onLogUpdate(imgLog, `Skipped (filename match): ${match.fileName}`, 'success');
+                    onProgress?.(i + 1, galleryImages.length);
+                    continue;
                 }
+            }
+
+            // Known-dead URL — never spend a request on it again. Counted as
+            // skipped, not failed: there is nothing to retry.
+            if (MediaDedup.isDead(image.url)) {
+                skippedCount++;
+                if (onLogUpdate && imgLog) onLogUpdate(imgLog, `Unreachable, skipping: ${displayUrl} (${MediaDedup.deadReason(image.url)})`, 'info');
+                onProgress?.(i + 1, galleryImages.length);
+                continue;
             }
 
             let dl = await api.downloadMediaToMemory?.(image.url, 30000, abortSignal);
             if (!dl?.success) {
-                errorCount++;
-                if (onLogUpdate && imgLog) onLogUpdate(imgLog, `Failed: ${displayUrl} - ${dl?.error || 'unknown'}`, 'error');
+                const failure = MediaDedup.recordFailure(image.url, MediaDedup.classifyFailure(dl));
+                if (failure.dead) {
+                    skippedCount++;
+                    if (onLogUpdate && imgLog) onLogUpdate(imgLog, `Unreachable, giving up: ${displayUrl} - ${dl?.error || 'unknown'}`, 'info');
+                } else {
+                    errorCount++;
+                    if (onLogUpdate && imgLog) onLogUpdate(imgLog, `Failed: ${displayUrl} - ${dl?.error || 'unknown'}`, 'error');
+                }
                 dl = null;
                 onProgress?.(i + 1, galleryImages.length);
                 continue;
             }
+            MediaDedup.recordSuccess(image.url);
 
             const hashMap = await ensureHashMap();
             const contentHash = await api.calculateHash?.(dl.arrayBuffer);
@@ -656,8 +669,7 @@ export class ProviderBase {
                 successCount++;
                 hashMap.set(contentHash, { fileName: saveResult.filename });
                 if (fileNameIndex) {
-                    const savedSanitized = resolveGalleryMediaName(image, api);
-                    if (savedSanitized) fileNameIndex.set(savedSanitized.toLowerCase(), { fileName: saveResult.filename, localPath: saveResult.localPath || '' });
+                    MediaDedup.noteSavedFile(fileNameIndex, { url: image.url, filename: image.name }, saveResult);
                 }
                 if (onLogUpdate && imgLog) onLogUpdate(imgLog, `Saved: ${saveResult.filename}`, 'success');
             } else {

@@ -8,6 +8,9 @@
 
 import ProviderRegistry from './providers/provider-registry.js';
 import CoreAPI from './core-api.js';
+// Sets window.MediaDedup on import — library.js is a classic script and reaches
+// the media dedup/ledger helpers only through that global.
+import './media-dedup.js';
 
 
 // ========================================
