@@ -62,6 +62,10 @@ const PERMANENT_ERROR_TEXT = [
     /blocked hostname/i,
     /empty hostname/i,
     /blocked private/i,
+    // ST core's /images/upload rejects any format outside its own MEDIA_EXTENSIONS
+    // whitelist (svg and avif aren't in it as of this writing). No retry fixes that
+    // — it's a save-step failure, not a network hiccup, so ledger it like a 404.
+    /invalid image format/i,
 ];
 
 // Extractor-level failures (whole gallery page, not one file) that won't heal.

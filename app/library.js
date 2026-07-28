@@ -22218,8 +22218,17 @@ async function downloadEmbeddedMediaForCharacter(folderName, mediaUrls, options 
             if (fileNameIndex) MD?.noteSavedFile(fileNameIndex, { url, filename: nameHint }, result);
             if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Saved: ${result.filename}`, 'success');
         } else {
-            errorCount++;
-            if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Failed: ${displayUrl} - ${result.error}`, 'error');
+            // A save can fail for reasons a retry will never fix (e.g. ST core
+            // rejecting a format outside its own upload whitelist, like svg/avif)
+            // just as surely as a download 404 — ledger it the same way.
+            const failure = MD?.recordFailure(url, MD.classifyFailure(result));
+            if (failure?.dead) {
+                skippedCount++;
+                if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Unreachable, giving up: ${displayUrl} - ${result.error}`, 'info');
+            } else {
+                errorCount++;
+                if (onLogUpdate && logEntry) onLogUpdate(logEntry, `Failed: ${displayUrl} - ${result.error}`, 'error');
+            }
         }
         
         if (onProgress) onProgress(i + 1, mediaUrls.length);
